@@ -37,3 +37,17 @@ python -m venv venv
 
 # Install strictly required dependencies
 pip install PyQt5 pyqtgraph pyvisa pyserial numpy
+```
+Usage
+Power on the XDM2041 and connect via USB.
+
+##Execute the application:
+ - python OMM_XDM2041.py
+ - Connect XDM Multimeter
+ - After succesful connection click "Pause/Resume" button
+
+##for Windows
+ - Download exe file and run
+ - Connect XDM Multimeter
+ - After succesful connection click "Pause/Resume" button
+   
