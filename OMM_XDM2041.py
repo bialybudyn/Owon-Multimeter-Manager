@@ -7,6 +7,10 @@ import os
 import logging
 import bisect
 import threading
+try:
+    import winsound
+except ImportError:
+    winsound = None
 from typing import Optional, Tuple, Dict, List
 
 import numpy as np
@@ -20,7 +24,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QComboBox, QPushButton, QLabel, QMessageBox,
     QGroupBox, QGridLayout, QProgressBar, QDoubleSpinBox,
-    QFileDialog, QCheckBox, QSpinBox, QTabWidget, QSplitter
+    QFileDialog, QCheckBox, QSpinBox, QTabWidget, QSplitter,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 # POPRAWKA PYINSTALLER: Unikamy bezpośredniego importu 'Qt', aby statyczna analiza AST działała poprawnie
 from PyQt5 import QtCore
@@ -166,6 +171,8 @@ class DiagnosticDashboard(QMainWindow):
         self.visa_lock = threading.Lock()
         self.acquisition_thread: Optional[AcquisitionThread] = None
         self.consecutive_errors: int = 0
+        self.is_beeping: bool = False
+        self.last_pf_status: str = "N/A"
 
         self.is_logging_active: bool = False
         self.csv_file_handle = None
@@ -461,6 +468,7 @@ class DiagnosticDashboard(QMainWindow):
         self.lbl_cont = QLabel()
         self.cont_threshold_spin = QSpinBox()
         self.cont_threshold_spin.setRange(1, 1000)
+        self.cont_threshold_spin.valueChanged.connect(self._schedule_device_sync)
 
         self.lbl_temp_unit = QLabel()
         self.temp_unit_selector = QComboBox()
@@ -538,10 +546,19 @@ class DiagnosticDashboard(QMainWindow):
         self.barmeter.setRange(0, 1000)
         self.barmeter.setFixedHeight(12)
 
+        self.pf_table = QTableWidget(0, 2)
+        self.pf_table.setHorizontalHeaderLabels(["Czas", "Wartość"])
+        self.pf_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.pf_table.setFixedHeight(120)
+        self.pf_table.setStyleSheet("QTableWidget { background-color: #252526; color: #d4d4d4; font-size: 11px; border: 1px solid #333; } QHeaderView::section { background-color: #333; color: #d4d4d4; }")
+        self.pf_table.verticalHeader().setVisible(False)
+        self.pf_table.setEditTriggers(QTableWidget.NoEditTriggers)
+
         parent_layout.addWidget(self.lbl_hv_warning)
         parent_layout.addWidget(self.lbl_current_val)
         parent_layout.addWidget(self.barmeter)
         parent_layout.addWidget(self.lbl_pf_indicator)
+        parent_layout.addWidget(self.pf_table)
 
     def _build_plot_controls(self, parent_layout: QVBoxLayout):
         ctrl_layout = QHBoxLayout()
@@ -986,7 +1003,7 @@ class DiagnosticDashboard(QMainWindow):
             self.instrument.write(f"SENSe:TEMPerature:RTD:TYPe {self.temp_type_selector.currentText()}")
             self.instrument.write(f"SENSe:TEMPerature:RTD:SHOW {self.temp_show_selector.currentText()}")
         if self.cont_threshold_spin.isEnabled():
-            self.instrument.write(f"SENSe:CONTinuity:THREshold {self.cont_threshold_spin.value()}")
+            self.instrument.write(f"SENSe:CONT:THREshold {self.cont_threshold_spin.value()}")
 
     def _process_acquisition_cycle(self, raw_response: str):
         try:
@@ -999,11 +1016,24 @@ class DiagnosticDashboard(QMainWindow):
             self._update_lcd_and_barmeter(primary_val, secondary_val, mode_name)
             self._append_data_to_plot(primary_val)
             self._handle_csv_logging(primary_val, mode_name, pf_status)
+            self._process_continuity_beep(mode_name, primary_val)
 
             self.consecutive_errors = 0
 
         except ValueError as e:
             logging.warning(f"Parse Error from instrument: {e}")
+
+    def _process_continuity_beep(self, mode_name: str, val: float):
+        if mode_name == "CONT" and self.chk_beeper.isChecked():
+            if val <= self.cont_threshold_spin.value():
+                if not self.is_beeping and winsound:
+                    self.is_beeping = True
+                    def beep_task():
+                        try:
+                            winsound.Beep(2500, 100)
+                        finally:
+                            self.is_beeping = False
+                    threading.Thread(target=beep_task, daemon=True).start()
 
     def _parse_scpi_measurement(self, raw_string: str) -> Tuple[float, Optional[float]]:
         if "," in raw_string:
@@ -1021,6 +1051,7 @@ class DiagnosticDashboard(QMainWindow):
         if not self.chk_enable_limits.isChecked():
             self.lbl_pf_indicator.setText(t["lbl_status_idle"])
             self.lbl_pf_indicator.setStyleSheet("color: #555;")
+            self.last_pf_status = "N/A"
             return "N/A"
 
         ul = self.limit_max_spin.value()
@@ -1029,11 +1060,36 @@ class DiagnosticDashboard(QMainWindow):
         if val > ul or val < ll:
             self.lbl_pf_indicator.setText(t["lbl_status_fail"])
             self.lbl_pf_indicator.setStyleSheet("color: #ff5252; font-weight: bold;")
+            if getattr(self, 'last_pf_status', 'N/A') != "FAIL":
+                self._log_pf_violation(val)
+            self.last_pf_status = "FAIL"
             return "FAIL"
         else:
             self.lbl_pf_indicator.setText(t["lbl_status_pass"])
             self.lbl_pf_indicator.setStyleSheet("color: #aeea00; font-weight: bold;")
+            self.last_pf_status = "PASS"
             return "PASS"
+
+    def _log_pf_violation(self, val: float):
+        row = self.pf_table.rowCount()
+        self.pf_table.insertRow(row)
+        
+        t_str = time.strftime('%H:%M:%S', time.localtime())
+        val_str = self._format_scientific_string(val)
+        
+        item_time = QTableWidgetItem(t_str)
+        item_time.setTextAlignment(QtCore.Qt.AlignCenter)
+        
+        item_val = QTableWidgetItem(val_str)
+        item_val.setTextAlignment(QtCore.Qt.AlignCenter)
+        item_val.setForeground(pg.mkColor('#ff5252'))
+        
+        self.pf_table.setItem(row, 0, item_time)
+        self.pf_table.setItem(row, 1, item_val)
+        self.pf_table.scrollToBottom()
+        
+        if row >= 50:
+            self.pf_table.removeRow(0)
 
     def _update_lcd_and_barmeter(self, primary_val: float, secondary_val: Optional[float], mode_name: str):
         if secondary_val is not None:
@@ -1263,6 +1319,9 @@ class DiagnosticDashboard(QMainWindow):
         self.deriv_timestamps.clear()
         self.deriv_readings.clear()
 
+        self.pf_table.setRowCount(0)
+        self.last_pf_status = "N/A"
+
         self.plot_sum = 0.0
         self.plot_min = float('inf')
         self.plot_max = float('-inf')
@@ -1285,6 +1344,9 @@ class DiagnosticDashboard(QMainWindow):
         self.readings.clear()
         self.deriv_timestamps.clear()
         self.deriv_readings.clear()
+
+        self.pf_table.setRowCount(0)
+        self.last_pf_status = "N/A"
 
         self.plot_sum = 0.0
         self.plot_min = float('inf')
