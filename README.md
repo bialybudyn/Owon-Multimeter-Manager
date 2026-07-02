@@ -21,7 +21,7 @@ GUI tool for controlling and logging data from the OWON XDM2041 bench multimeter
 
 ## Requirements
 - Python 3.7+
-- OWON XDM2041 via USB.
+- OWON XDM2041 via USB to Serial adapter.
 - Virtual COM port drivers (manufacturer provided).
 
 ## Installation
